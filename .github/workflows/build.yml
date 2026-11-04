@@ -1,0 +1,302 @@
+name: MP build
+
+# 本仓库是公开的，只放 workflow 与 README；小程序源码与脚本全在私有仓库（vars.CONTENT_REPO）。
+# 私有仓库 push → repository_dispatch(mp-build) → 本 workflow：checkout 指定 sha → 安装 / 类型检查 /
+# 构建（无上传密钥）→ 注入 MP_UPLOAD_KEY 上传或出预览二维码 → 加密 artifact → 企业微信通知。
+#
+# 公开仓库的日志与 artifact 谁都能看，所以：
+#   - 安装 / 类型检查 / 构建 / 上传 / 通知的输出一律重定向到 $RUNNER_TEMP/private，日志里只写通过/失败、用时、退出码；
+#   - 描述含提交信息，不能进公开日志；版本号、文件名不写进 $GITHUB_ENV / $GITHUB_OUTPUT；
+#   - artifact 用 ARTIFACT_PASSPHRASE 加密后才上传，没配口令就不上传；不写 step summary；
+#   - 结果推企业微信（secrets.NOTIFY_WEBHOOK），消息由私有仓库 scripts/notify-build.mjs 拼，请求体和响应都不进公开日志；
+#   - 只允许 repository_dispatch / workflow_dispatch，不接任何 PR 事件（含 pull_request_target）；
+#   - 第三方 action 固定到提交 SHA（后面注释是对应的 tag）。
+#
+# 解密 artifact：
+#   openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -pass env:PASS -in run-N.tar.gz.enc | tar xzf -
+
+run-name: mp-build
+
+permissions:
+  contents: read
+
+on:
+  repository_dispatch:
+    types: [mp-build]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "分支名或 commit sha"
+        required: true
+        default: main
+      mode:
+        description: "upload = 上传为开发版；preview = 只出预览二维码"
+        type: choice
+        options: [upload, preview]
+        default: upload
+      robot:
+        description: "ci 机器人编号 1-30；留空则 main→1、其它分支→2"
+        required: false
+      version:
+        description: "版本号，留空取 package.json（手动填写会出现在 Actions 输入里，尽量留空）"
+        required: false
+      desc:
+        description: "版本描述，留空取最近一次提交（手动填写会出现在 Actions 输入里，尽量留空）"
+        required: false
+
+concurrency:
+  group: mp-build-${{ github.event.client_payload.ref || inputs.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Preflight
+        env:
+          CONTENT_REPO: ${{ vars.CONTENT_REPO }}
+          HAS_CONTENT_TOKEN: ${{ secrets.CONTENT_REPO_TOKEN != '' }}
+          HAS_UPLOAD_KEY: ${{ secrets.MP_UPLOAD_KEY != '' }}
+          PRIV: ${{ runner.temp }}/private
+        run: |
+          set -euo pipefail
+          miss=""
+          [ -n "${CONTENT_REPO}" ] || miss="$miss vars.CONTENT_REPO"
+          [ "${HAS_CONTENT_TOKEN}" = "true" ] || miss="$miss secrets.CONTENT_REPO_TOKEN"
+          [ "${HAS_UPLOAD_KEY}" = "true" ] || miss="$miss secrets.MP_UPLOAD_KEY"
+          if [ -n "$miss" ]; then
+            echo "::error::缺少配置：$miss（Settings → Secrets and variables → Actions）"
+            exit 1
+          fi
+          mkdir -p "$PRIV" "${RUNNER_TEMP}/out"
+          date +%s > "$PRIV/t0"
+          # 从事件文件解析参数，避免把 version / desc 写进 env 块（会被打印）
+          node -e '
+            const fs = require("fs");
+            const e = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+            const priv = process.env.PRIV;
+            const out = { mode: "upload", robot: "", ref: "", sha: "" };
+            if (e.client_payload) {
+              out.ref = String(e.client_payload.ref || "");
+              out.sha = String(e.client_payload.sha || "");
+              out.mode = "upload";
+            } else {
+              const i = e.inputs || {};
+              out.ref = String(i.ref || "main");
+              out.sha = "";
+              out.mode = i.mode === "preview" ? "preview" : "upload";
+              out.robot = String(i.robot || "").trim();
+              if (i.version) fs.writeFileSync(priv + "/version.override", String(i.version));
+              if (i.desc) fs.writeFileSync(priv + "/desc.override", String(i.desc));
+            }
+            const branch = out.ref.replace(/^refs\/heads\//, "") || "main";
+            fs.writeFileSync(priv + "/branch", branch);
+            if (!out.robot) out.robot = branch === "main" ? "1" : "2";
+            const n = Number(out.robot);
+            if (!Number.isInteger(n) || n < 1 || n > 30) {
+              console.error("robot 只能是 1 到 30");
+              process.exit(1);
+            }
+            out.robot = String(n);
+            if (out.mode !== "upload" && out.mode !== "preview") {
+              console.error("mode 只能是 upload 或 preview");
+              process.exit(1);
+            }
+            fs.writeFileSync(priv + "/params.json", JSON.stringify(out));
+            console.log("preflight ok · mode=" + out.mode + " · robot=" + out.robot);
+          '
+
+      - name: Checkout content repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ vars.CONTENT_REPO }}
+          token: ${{ secrets.CONTENT_REPO_TOKEN }}
+          ref: ${{ github.event.client_payload.sha || github.event.client_payload.ref || inputs.ref }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: |
+          set +e -uo pipefail
+          PRIV="${RUNNER_TEMP}/private"
+          t0=$SECONDS
+          pnpm install --frozen-lockfile > "$PRIV/install.log" 2>&1
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "✓ install（用时 $((SECONDS - t0))s，退出码 $rc）"
+          else
+            echo "✗ install（用时 $((SECONDS - t0))s，退出码 $rc）"
+            exit "$rc"
+          fi
+
+      - name: Type-check
+        run: |
+          set +e -uo pipefail
+          PRIV="${RUNNER_TEMP}/private"
+          t0=$SECONDS
+          pnpm type-check > "$PRIV/typecheck.log" 2>&1
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "✓ type-check（用时 $((SECONDS - t0))s，退出码 $rc）"
+          else
+            echo "✗ type-check（用时 $((SECONDS - t0))s，退出码 $rc）"
+            exit "$rc"
+          fi
+
+      - name: Build
+        run: |
+          set +e -uo pipefail
+          PRIV="${RUNNER_TEMP}/private"
+          t0=$SECONDS
+          # 本步故意不注入 MP_UPLOAD_KEY
+          pnpm build:weapp > "$PRIV/build.log" 2>&1
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "✓ build（用时 $((SECONDS - t0))s，退出码 $rc）"
+          else
+            echo "✗ build（用时 $((SECONDS - t0))s，退出码 $rc）"
+            exit "$rc"
+          fi
+          # 版本号只写进私有目录，不进 GITHUB_ENV / GITHUB_OUTPUT
+          node -e 'const v=require("./package.json").version; require("fs").writeFileSync(process.env.PRIV+"/version", v);' 
+        env:
+          PRIV: ${{ runner.temp }}/private
+
+      - name: Upload
+        env:
+          MP_UPLOAD_KEY: ${{ secrets.MP_UPLOAD_KEY }}
+          PRIV: ${{ runner.temp }}/private
+        run: |
+          set +e -uo pipefail
+          MODE=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.PRIV+"/params.json","utf8")).mode)')
+          ROBOT=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.PRIV+"/params.json","utf8")).robot)')
+          # 可选覆盖：从私有文件读，不 echo 内容
+          if [ -s "$PRIV/version.override" ]; then
+            export MP_VERSION="$(cat "$PRIV/version.override")"
+          fi
+          if [ -s "$PRIV/desc.override" ]; then
+            export MP_DESC="$(cat "$PRIV/desc.override")"
+          fi
+          export MP_ROBOT="$ROBOT"
+          t0=$SECONDS
+          node scripts/mp-ci.mjs "$MODE" --skip-build > "$PRIV/upload.log" 2>&1
+          rc=$?
+          # 公开日志只写通过/失败与用时，不写 mode/robot/版本（避免与描述一并泄露）
+          if [ "$rc" -eq 0 ]; then
+            echo "✓ upload（用时 $((SECONDS - t0))s，退出码 $rc）"
+          else
+            echo "✗ upload（用时 $((SECONDS - t0))s，退出码 $rc）"
+            exit "$rc"
+          fi
+
+      - name: Encrypt artifact
+        if: always()
+        env:
+          PASS: ${{ secrets.ARTIFACT_PASSPHRASE }}
+          PRIV: ${{ runner.temp }}/private
+        run: |
+          set -uo pipefail
+          if [ -z "${PASS}" ]; then
+            echo "::warning::未配置 ARTIFACT_PASSPHRASE，跳过 artifact（公开仓库不上传明文）"
+            exit 0
+          fi
+          STAGE="${RUNNER_TEMP}/stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/logs" "$STAGE/dist" "${RUNNER_TEMP}/out"
+          if [ -d dist/build/mp-weixin ]; then
+            cp -a dist/build/mp-weixin "$STAGE/dist/"
+          fi
+          if [ -d "$PRIV" ]; then
+            cp -a "$PRIV"/. "$STAGE/logs/" 2>/dev/null || true
+          fi
+          if [ -f dist/mp-preview.jpg ]; then
+            cp dist/mp-preview.jpg "$STAGE/"
+          fi
+          OUT="${RUNNER_TEMP}/out/run-${GITHUB_RUN_NUMBER}.tar.gz.enc"
+          tar czf - -C "$STAGE" . 2>/dev/null \
+            | openssl enc -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -salt -pass env:PASS \
+              -out "$OUT"
+          echo "已加密：$(du -h "$OUT" | cut -f1)"
+
+      - name: Upload encrypted artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mp-build-${{ github.run_number }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Notify WeCom
+        if: always()
+        env:
+          NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          JOB_STATUS: ${{ job.status }}
+          PRIV: ${{ runner.temp }}/private
+        run: |
+          set +e -uo pipefail
+          if [ -z "$NOTIFY_WEBHOOK" ]; then
+            echo "::warning::未配置 NOTIFY_WEBHOOK，本轮结果没推企业微信"
+            exit 0
+          fi
+          N="$PRIV/notify"
+          mkdir -p "$N"
+          # 拼概况进私有文件：分支、short sha、版本、结果、用时；失败附私有日志末尾约 30 行
+          # 请求体与响应都不进公开日志
+          SHORT=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
+          BRANCH=$(cat "$PRIV/branch" 2>/dev/null || echo "?")
+          VER=$(cat "$PRIV/version" 2>/dev/null || echo "?")
+          T=""
+          if [ -s "$PRIV/t0" ]; then T=$(( $(date +%s) - $(cat "$PRIV/t0") )); fi
+          TOOK=""
+          if [ -n "$T" ]; then TOOK=$(printf '%dm%02ds' $((T / 60)) $((T % 60))); fi
+          if [ "$JOB_STATUS" = success ]; then
+            TITLE="✅ 小程序构建 #${GITHUB_RUN_NUMBER}"
+            RESULT="成功"
+          elif [ "$JOB_STATUS" = cancelled ]; then
+            TITLE="⏹ 小程序构建 #${GITHUB_RUN_NUMBER}：被取消"
+            RESULT="取消"
+          else
+            TITLE="❌ 小程序构建 #${GITHUB_RUN_NUMBER}：失败"
+            RESULT="失败"
+          fi
+          {
+            printf '**分支** %s · **sha** %s · **版本** %s\n' "$BRANCH" "$SHORT" "$VER"
+            printf '**结果** %s' "$RESULT"
+            [ -n "$TOOK" ] && printf ' · **用时** %s' "$TOOK"
+            echo
+          } > "$N/summary.md"
+          if [ "$JOB_STATUS" != success ] && [ "$JOB_STATUS" != cancelled ]; then
+            {
+              echo "✗ 构建/上传失败"
+              echo "--- 日志末尾 ---"
+              for f in upload.log build.log typecheck.log install.log; do
+                if [ -s "$PRIV/$f" ]; then
+                  echo "### $f"
+                  tail -n 30 "$PRIV/$f"
+                fi
+              done
+            } > "$N/fail.txt"
+          fi
+          if [ -f scripts/notify-build.mjs ]; then
+            ARGS=(--title "$TITLE" --md "$N/summary.md" --button "运行记录|${RUN_URL}")
+            [ -s "$N/fail.txt" ] && ARGS+=(--fail "$N/fail.txt")
+            node scripts/notify-build.mjs "${ARGS[@]}" > "$N/send.log" 2>&1
+            RC=$?
+            # 脚本只应打印「已推送 / 失败」类一行，不含消息内容
+            cat "$N/send.log"
+          else
+            echo "::warning::没有 scripts/notify-build.mjs，跳过通知"
+            RC=0
+          fi
+          [ "$RC" -eq 0 ] || echo "::warning::企业微信推送失败"
