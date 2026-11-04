@@ -18,17 +18,21 @@
 
 | 名字 | 最小权限 / 来源 | 说明 |
 | --- | --- | --- |
-| `CONTENT_REPO_TOKEN` | Fine-grained PAT 或 classic PAT：对 `CONTENT_REPO` 的 **Contents: Read** | 检出私有仓库指定 sha |
+| `CONTENT_REPO_TOKEN` | Fine-grained PAT：Repository access 只选 `forever-talents-mp`，**Contents: Read**（Metadata: Read 自动带上） | 检出私有仓库指定 sha |
 | `MP_UPLOAD_KEY` | 微信小程序后台 → 开发管理 → 开发设置 → 小程序代码上传 → 生成的 `private.*.key` 全文 | 只注入「上传」那一步；GitHub 出口 IP 不固定，后台需关掉上传密钥 IP 白名单 |
 | `ARTIFACT_PASSPHRASE` | 自定长随机口令 | 加密 artifact；**没配就不上传 artifact**（公开仓库不放明文） |
 | `NOTIFY_WEBHOOK` | 自建 Message Pusher 的 webhook URL | 企业微信卡片通知；没配则跳过通知 |
 
-私有仓库侧另需 `BUILD_RUNNER_TOKEN`（对**本公开仓库**的 **Contents: Read** + **Metadata: Read**，并具备触发 `repository_dispatch` 的权限——classic PAT 需 `repo` 对 public 仓库写 workflows 相关，或 fine-grained：**Contents: Read** + 允许 Actions / 对目标仓库发 `repository_dispatch`）。该 token 配在私有仓库，不配在本仓库。
+### 私有仓库侧（`forever-talents-mp`，不配在本仓库）
+
+| 名字 | 最小权限 | 说明 |
+| --- | --- | --- |
+| `BUILD_RUNNER_TOKEN` | Fine-grained PAT：Repository access 只选 `forever-mp-build-runner`，权限只开 **Contents: Read and write**（Metadata: Read 会自动带上） | 调 `POST /repos/yi-vincent/forever-mp-build-runner/dispatches` 需要对目标仓库 Contents 读写；只读不行 |
 
 ## 触发方式
 
-1. **自动**：私有仓库任意分支 push（路径命中 `src/**`、`package.json`、`pnpm-lock.yaml`、`scripts/**`）→ `dispatch-build.yml` 对本仓库发 `repository_dispatch`（`event_type=mp-build`，payload 仅 `{ref, sha}`）。
-2. **手动**：本仓库 Actions 页 → `MP build` → Run workflow。可填 `ref` / `mode` / `robot` / `version` / `desc`。`version`、`desc` 会进 GitHub 的输入展示，尽量留空（留空则版本取 `package.json`、描述取提交信息，且只进加密日志）。
+1. **自动**：私有仓库任意分支 push（路径命中 `src/**`、`package.json`、`pnpm-lock.yaml`、`scripts/**`）→ `dispatch-build.yml` 对本仓库发 `repository_dispatch`（`event_type=mp-build`，payload 为 `{ref, sha, group}`；`group` = ref 的 sha256 前 16 位，供 concurrency 分组，避免明文分支名出现在取消提示里）。
+2. **手动**：本仓库 Actions 页 → `MP build` → Run workflow。可填 `ref` / `mode` / `robot` / `version` / `desc`。`version`、`desc` 会进 GitHub 的输入展示，尽量留空（留空则版本取 `package.json`、描述取提交信息，且只进加密日志）。手动触发的 concurrency 组名为 `mp-build-manual`。
 
 机器人默认：`main` → 1，其它分支 → 2（可被手动输入覆盖）。
 

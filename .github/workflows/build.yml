@@ -5,10 +5,13 @@ name: MP build
 # 构建（无上传密钥）→ 注入 MP_UPLOAD_KEY 上传或出预览二维码 → 加密 artifact → 企业微信通知。
 #
 # 公开仓库的日志与 artifact 谁都能看，所以：
+#   - 不用 actions/checkout（会打印提交标题 / 分支名）；改为 git init + fetch，输出进 $PRIV；
 #   - 安装 / 类型检查 / 构建 / 上传 / 通知的输出一律重定向到 $RUNNER_TEMP/private，日志里只写通过/失败、用时、退出码；
 #   - 描述含提交信息，不能进公开日志；版本号、文件名不写进 $GITHUB_ENV / $GITHUB_OUTPUT；
+#   - concurrency 组名用 payload.group（ref 的 sha256 前 16 位），不用明文分支名；
 #   - artifact 用 ARTIFACT_PASSPHRASE 加密后才上传，没配口令就不上传；不写 step summary；
-#   - 结果推企业微信（secrets.NOTIFY_WEBHOOK），消息由私有仓库 scripts/notify-build.mjs 拼，请求体和响应都不进公开日志；
+#   - 结果推企业微信（secrets.NOTIFY_WEBHOOK），消息由私有仓库 scripts/notify-build.mjs 拼；
+#     脚本不存在（checkout 失败）时 jq+curl 发兜底消息；请求体和响应都不进公开日志；
 #   - 只允许 repository_dispatch / workflow_dispatch，不接任何 PR 事件（含 pull_request_target）；
 #   - 第三方 action 固定到提交 SHA（后面注释是对应的 tag）。
 #
@@ -44,8 +47,9 @@ on:
         description: "版本描述，留空取最近一次提交（手动填写会出现在 Actions 输入里，尽量留空）"
         required: false
 
+# group 由私有仓库 dispatch 传入（ref 的 sha256 前 16 位）；手动触发共用 manual，避免明文分支名出现在取消提示里
 concurrency:
-  group: mp-build-${{ github.event.client_payload.ref || inputs.ref || github.run_id }}
+  group: mp-build-${{ github.event.client_payload.group || 'manual' }}
   cancel-in-progress: true
 
 jobs:
@@ -76,10 +80,11 @@ jobs:
             const fs = require("fs");
             const e = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
             const priv = process.env.PRIV;
-            const out = { mode: "upload", robot: "", ref: "", sha: "" };
+            const out = { mode: "upload", robot: "", ref: "", sha: "", group: "" };
             if (e.client_payload) {
               out.ref = String(e.client_payload.ref || "");
               out.sha = String(e.client_payload.sha || "");
+              out.group = String(e.client_payload.group || "");
               out.mode = "upload";
             } else {
               const i = e.inputs || {};
@@ -108,12 +113,48 @@ jobs:
           '
 
       - name: Checkout content repo
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: ${{ vars.CONTENT_REPO }}
-          token: ${{ secrets.CONTENT_REPO_TOKEN }}
-          ref: ${{ github.event.client_payload.sha || github.event.client_payload.ref || inputs.ref }}
-          persist-credentials: false
+        env:
+          CONTENT_REPO: ${{ vars.CONTENT_REPO }}
+          TOKEN: ${{ secrets.CONTENT_REPO_TOKEN }}
+          PRIV: ${{ runner.temp }}/private
+        run: |
+          set +e -uo pipefail
+          t0=$SECONDS
+          # 不用 actions/checkout：会打印提交标题与分支名。token 只经 http.extraheader 传入单次命令，不写进 git config。
+          {
+            REF=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.env.PRIV+"/params.json","utf8")).ref||"")')
+            SHA=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.env.PRIV+"/params.json","utf8")).sha||"")')
+            AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+            git init
+            git remote add origin "https://github.com/${CONTENT_REPO}.git"
+            if [ -z "$SHA" ]; then
+              if printf '%s' "$REF" | grep -qiE '^[0-9a-f]{40}$'; then
+                SHA=$REF
+              else
+                git -c http.extraheader="AUTHORIZATION: basic ${AUTH}" ls-remote origin "$REF" > "$PRIV/ls-remote.txt"
+                SHA=$(awk 'NF { print $1; exit }' "$PRIV/ls-remote.txt")
+                if [ -z "$SHA" ]; then
+                  git -c http.extraheader="AUTHORIZATION: basic ${AUTH}" ls-remote origin "refs/heads/${REF}" > "$PRIV/ls-remote.txt"
+                  SHA=$(awk 'NF { print $1; exit }' "$PRIV/ls-remote.txt")
+                fi
+                if [ -z "$SHA" ]; then
+                  echo "无法把 ref 解析成 sha" >&2
+                  exit 1
+                fi
+              fi
+              node -e 'const fs=require("fs");const p=process.env.PRIV+"/params.json";const o=JSON.parse(fs.readFileSync(p,"utf8"));o.sha=process.argv[1];fs.writeFileSync(p,JSON.stringify(o));' "$SHA"
+            fi
+            git -c http.extraheader="AUTHORIZATION: basic ${AUTH}" fetch --depth 1 origin "$SHA"
+            git checkout FETCH_HEAD
+            unset AUTH
+          } >"$PRIV/checkout.log" 2>&1
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "✓ checkout（用时 $((SECONDS - t0))s，退出码 $rc）"
+          else
+            echo "✗ checkout（用时 $((SECONDS - t0))s，退出码 $rc）"
+            exit "$rc"
+          fi
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
@@ -122,14 +163,14 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-          cache: pnpm
+          # 不开 cache: pnpm —— cache key / 路径会进公开日志，且公开仓缓存可被其它 workflow 恢复
 
       - name: Install
         run: |
           set +e -uo pipefail
           PRIV="${RUNNER_TEMP}/private"
           t0=$SECONDS
-          pnpm install --frozen-lockfile > "$PRIV/install.log" 2>&1
+          pnpm install --frozen-lockfile >"$PRIV/install.log" 2>&1
           rc=$?
           if [ "$rc" -eq 0 ]; then
             echo "✓ install（用时 $((SECONDS - t0))s，退出码 $rc）"
@@ -143,7 +184,7 @@ jobs:
           set +e -uo pipefail
           PRIV="${RUNNER_TEMP}/private"
           t0=$SECONDS
-          pnpm type-check > "$PRIV/typecheck.log" 2>&1
+          pnpm type-check >"$PRIV/typecheck.log" 2>&1
           rc=$?
           if [ "$rc" -eq 0 ]; then
             echo "✓ type-check（用时 $((SECONDS - t0))s，退出码 $rc）"
@@ -153,12 +194,13 @@ jobs:
           fi
 
       - name: Build
+        env:
+          PRIV: ${{ runner.temp }}/private
         run: |
           set +e -uo pipefail
-          PRIV="${RUNNER_TEMP}/private"
           t0=$SECONDS
           # 本步故意不注入 MP_UPLOAD_KEY
-          pnpm build:weapp > "$PRIV/build.log" 2>&1
+          pnpm build:weapp >"$PRIV/build.log" 2>&1
           rc=$?
           if [ "$rc" -eq 0 ]; then
             echo "✓ build（用时 $((SECONDS - t0))s，退出码 $rc）"
@@ -167,9 +209,7 @@ jobs:
             exit "$rc"
           fi
           # 版本号只写进私有目录，不进 GITHUB_ENV / GITHUB_OUTPUT
-          node -e 'const v=require("./package.json").version; require("fs").writeFileSync(process.env.PRIV+"/version", v);' 
-        env:
-          PRIV: ${{ runner.temp }}/private
+          node -e 'const v=require("./package.json").version; require("fs").writeFileSync(process.env.PRIV+"/version", v);'
 
       - name: Upload
         env:
@@ -177,20 +217,22 @@ jobs:
           PRIV: ${{ runner.temp }}/private
         run: |
           set +e -uo pipefail
-          MODE=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.PRIV+"/params.json","utf8")).mode)')
-          ROBOT=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.PRIV+"/params.json","utf8")).robot)')
+          MODE=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.env.PRIV+"/params.json","utf8")).mode)')
+          ROBOT=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.env.PRIV+"/params.json","utf8")).robot)')
           # 可选覆盖：从私有文件读，不 echo 内容
           if [ -s "$PRIV/version.override" ]; then
+            # shellcheck disable=SC2155
             export MP_VERSION="$(cat "$PRIV/version.override")"
           fi
           if [ -s "$PRIV/desc.override" ]; then
+            # shellcheck disable=SC2155
             export MP_DESC="$(cat "$PRIV/desc.override")"
           fi
           export MP_ROBOT="$ROBOT"
           t0=$SECONDS
-          node scripts/mp-ci.mjs "$MODE" --skip-build > "$PRIV/upload.log" 2>&1
+          node scripts/mp-ci.mjs "$MODE" --skip-build >"$PRIV/upload.log" 2>&1
           rc=$?
-          # 公开日志只写通过/失败与用时，不写 mode/robot/版本（避免与描述一并泄露）
+          # 公开日志只写通过/失败与用时，不写 mode/robot/版本
           if [ "$rc" -eq 0 ]; then
             echo "✓ upload（用时 $((SECONDS - t0))s，退出码 $rc）"
           else
@@ -275,28 +317,40 @@ jobs:
             printf '**结果** %s' "$RESULT"
             [ -n "$TOOK" ] && printf ' · **用时** %s' "$TOOK"
             echo
-          } > "$N/summary.md"
+          } >"$N/summary.md"
           if [ "$JOB_STATUS" != success ] && [ "$JOB_STATUS" != cancelled ]; then
             {
               echo "✗ 构建/上传失败"
               echo "--- 日志末尾 ---"
-              for f in upload.log build.log typecheck.log install.log; do
+              for f in checkout.log upload.log build.log typecheck.log install.log; do
                 if [ -s "$PRIV/$f" ]; then
                   echo "### $f"
                   tail -n 30 "$PRIV/$f"
                 fi
               done
-            } > "$N/fail.txt"
+            } >"$N/fail.txt"
           fi
           if [ -f scripts/notify-build.mjs ]; then
             ARGS=(--title "$TITLE" --md "$N/summary.md" --button "运行记录|${RUN_URL}")
             [ -s "$N/fail.txt" ] && ARGS+=(--fail "$N/fail.txt")
-            node scripts/notify-build.mjs "${ARGS[@]}" > "$N/send.log" 2>&1
+            node scripts/notify-build.mjs "${ARGS[@]}" >"$N/send.log" 2>&1
             RC=$?
             # 脚本只应打印「已推送 / 失败」类一行，不含消息内容
             cat "$N/send.log"
           else
-            echo "::warning::没有 scripts/notify-build.mjs，跳过通知"
-            RC=0
+            # checkout 失败时私有仓库脚本不存在：jq 拼兜底消息，curl 发出，输出进 $PRIV
+            FALLBACK_TITLE="❌ 小程序构建 #${GITHUB_RUN_NUMBER}：checkout 失败"
+            jq -n --arg t "$FALLBACK_TITLE" --arg u "$RUN_URL" \
+              '{title: $t, description: "checkout 失败，点详情看运行记录", content: ("[运行记录](" + $u + ")"), url: ""}' \
+              >"$N/msg.json"
+            curl -sS -m 20 -H 'Content-Type: application/json' \
+              --data-binary @"$N/msg.json" "$NOTIFY_WEBHOOK" >"$N/send.log" 2>&1
+            if grep -q '"success":true' "$N/send.log" 2>/dev/null; then
+              echo "已推送企业微信"
+              RC=0
+            else
+              echo "企业微信推送失败"
+              RC=1
+            fi
           fi
           [ "$RC" -eq 0 ] || echo "::warning::企业微信推送失败"
