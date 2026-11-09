@@ -34,7 +34,7 @@
 ## 触发方式
 
 1. **自动**：私有仓库任意分支 push（路径命中 `src/**`、`package.json`、`pnpm-lock.yaml`、`scripts/**`）→ `dispatch-build.yml` 对本仓库发 `repository_dispatch`（`event_type=mp-build`，payload 为 `{ref, sha, group}`；`group` = ref 的 sha256 前 16 位，供 concurrency 分组，避免明文分支名出现在取消提示里）。
-2. **手动**：本仓库 Actions 页 → `MP build` → Run workflow。可填 `ref` / `mode` / `robot` / `version` / `desc`。`version`、`desc` 会进 GitHub 的输入展示，尽量留空（留空则版本取 `package.json`、描述取提交信息，且只进加密日志）。手动触发的 concurrency 组名为 `mp-build-manual`。
+2. **手动**：本仓库 Actions 页 → `MP build` → Run workflow。可填 `ref` / `mode` / `robot` / `desc`。`desc` 会进 GitHub 的输入展示，尽量留空（留空则描述取提交信息，且只进加密日志）。上传不再带 `package.json` 版本号（微信侧占位 `ci`）。手动触发的 concurrency 组名为 `mp-build-manual`。
 
 机器人默认：`main` → 1，其它分支 → 2（可被手动输入覆盖）。
 

@@ -45,11 +45,8 @@ on:
       robot:
         description: "ci 机器人编号 1-30；留空则 main→1、其它分支→2"
         required: false
-      version:
-        description: "版本号，留空取 package.json（手动填写会出现在 Actions 输入里，尽量留空）"
-        required: false
       desc:
-        description: "版本描述，留空取最近一次提交（手动填写会出现在 Actions 输入里，尽量留空）"
+        description: "项目备注，留空取最近一次提交（手动填写会出现在 Actions 输入里，尽量留空）"
         required: false
 
 # group 由私有仓库 dispatch 传入（ref 的 sha256 前 16 位）；手动触发共用 manual，避免明文分支名出现在取消提示里
@@ -84,7 +81,7 @@ jobs:
           fi
           mkdir -p "$PRIV" "${RUNNER_TEMP}/out"
           date +%s > "$PRIV/t0"
-          # 从事件文件解析参数，避免把 version / desc 写进 env 块（会被打印）
+          # 从事件文件解析参数，避免把 desc 写进 env 块（会被打印）；上传不再带版本号
           node -e '
             const fs = require("fs");
             const e = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
@@ -101,7 +98,6 @@ jobs:
               out.sha = "";
               out.mode = i.mode === "preview" ? "preview" : "upload";
               out.robot = String(i.robot || "").trim();
-              if (i.version) fs.writeFileSync(priv + "/version.override", String(i.version));
               if (i.desc) fs.writeFileSync(priv + "/desc.override", String(i.desc));
             }
             const branch = out.ref.replace(/^refs\/heads\//, "") || "main";
@@ -224,8 +220,6 @@ jobs:
           build_one 361f pnpm build:weapp
           build_one ee7d pnpm build:weapp:ee7d
           build_one 13b0 pnpm build:weapp:13b0
-          # 版本号只写进私有目录，不进 GITHUB_ENV / GITHUB_OUTPUT
-          node -e 'const v=require("./package.json").version; require("fs").writeFileSync(process.env.PRIV+"/version", v);'
           # 兼容通知里扫旧文件名：把默认包日志再拷一份
           [ -f "$PRIV/build-361f.log" ] && cp "$PRIV/build-361f.log" "$PRIV/build.log"
           [ "$fail" -eq 0 ] || exit 1
@@ -240,11 +234,7 @@ jobs:
           set +e -uo pipefail
           MODE=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.env.PRIV+"/params.json","utf8")).mode)')
           ROBOT=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.env.PRIV+"/params.json","utf8")).robot)')
-          # 可选覆盖：从私有文件读，不 echo 内容
-          if [ -s "$PRIV/version.override" ]; then
-            # shellcheck disable=SC2155
-            export MP_VERSION="$(cat "$PRIV/version.override")"
-          fi
+          # 可选覆盖描述：从私有文件读，不 echo 内容；不再传 MP_VERSION（mp-ci 默认占位 ci）
           if [ -s "$PRIV/desc.override" ]; then
             # shellcheck disable=SC2155
             export MP_DESC="$(cat "$PRIV/desc.override")"
@@ -342,11 +332,10 @@ jobs:
           fi
           N="$PRIV/notify"
           mkdir -p "$N"
-          # 拼概况进私有文件：分支、short sha、版本、结果、用时；失败附私有日志末尾约 30 行
-          # 请求体与响应都不进公开日志
+          # 拼概况进私有文件：分支、short sha、结果、用时；失败附私有日志末尾约 30 行
+          # 请求体与响应都不进公开日志；上传不再带版本号，通知里也不写
           SHORT=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
           BRANCH=$(cat "$PRIV/branch" 2>/dev/null || echo "?")
-          VER=$(cat "$PRIV/version" 2>/dev/null || echo "?")
           T=""
           if [ -s "$PRIV/t0" ]; then T=$(( $(date +%s) - $(cat "$PRIV/t0") )); fi
           TOOK=""
@@ -362,7 +351,7 @@ jobs:
             RESULT="失败"
           fi
           {
-            printf '**分支** %s · **sha** %s · **版本** %s\n' "$BRANCH" "$SHORT" "$VER"
+            printf '**分支** %s · **sha** %s\n' "$BRANCH" "$SHORT"
             printf '**结果** %s · **三包** 361f / ee7d / 13b0' "$RESULT"
             [ -n "$TOOK" ] && printf ' · **用时** %s' "$TOOK"
             echo
