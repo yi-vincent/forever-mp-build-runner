@@ -81,7 +81,7 @@ jobs:
           fi
           mkdir -p "$PRIV" "${RUNNER_TEMP}/out"
           date +%s > "$PRIV/t0"
-          # 从事件文件解析参数，避免把 desc 写进 env 块（会被打印）；上传不再带版本号
+          # 从事件文件解析参数，避免把 desc 写进 env 块（会被打印）；版本号由私有仓 mp-ci 取 package.json
           node -e '
             const fs = require("fs");
             const e = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
@@ -234,7 +234,7 @@ jobs:
           set +e -uo pipefail
           MODE=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.env.PRIV+"/params.json","utf8")).mode)')
           ROBOT=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.env.PRIV+"/params.json","utf8")).robot)')
-          # 可选覆盖描述：从私有文件读，不 echo 内容；不再传 MP_VERSION（mp-ci 默认占位 ci）
+          # 可选覆盖描述：从私有文件读，不 echo 内容；版本由 mp-ci 读 package.json（三包统一 10.1.x）
           if [ -s "$PRIV/desc.override" ]; then
             # shellcheck disable=SC2155
             export MP_DESC="$(cat "$PRIV/desc.override")"
