@@ -19,7 +19,9 @@
 | 名字 | 最小权限 / 来源 | 说明 |
 | --- | --- | --- |
 | `CONTENT_REPO_TOKEN` | Fine-grained PAT：Repository access 只选 `forever-talents-mp`，**Contents: Read**（Metadata: Read 自动带上） | 检出私有仓库指定 sha |
-| `MP_UPLOAD_KEY` | 微信小程序后台 → 开发管理 → 开发设置 → 小程序代码上传 → 生成的 `private.*.key` 全文 | 只注入「上传」那一步；GitHub 出口 IP 不固定，后台需关掉上传密钥 IP 白名单 |
+| `MP_UPLOAD_KEY` | 微信小程序后台 → `wx361ffea9540b3d03`（默认个人包）上传密钥全文 | 只注入「上传」那一步；GitHub 出口 IP 不固定，后台需关掉上传密钥 IP 白名单 |
+| `MP_UPLOAD_KEY_EE7D` | `wxee7d5cea3f941940`（个人包）上传密钥全文 | 同上 |
+| `MP_UPLOAD_KEY_13B0` | `wx13b0a3575393c010`（企业 UGC 包）上传密钥全文 | 同上 |
 | `ARTIFACT_PASSPHRASE` | 自定长随机口令 | 加密 artifact；**没配就不上传 artifact**（公开仓库不放明文） |
 | `NOTIFY_WEBHOOK` | 自建 Message Pusher 的 webhook URL | 企业微信卡片通知；没配则跳过通知 |
 
@@ -44,7 +46,9 @@ openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -pass env:PASS \
   -in run-N.tar.gz.enc | tar xzf -
 ```
 
-解压后大致结构：`dist/mp-weixin/`（发行包）、`logs/`（私有步骤日志）、可选 `mp-preview.jpg`。
+解压后大致结构：`dist/mp-weixin/`、`dist/mp-weixin-wx…/`（三个 appid 发行包）、`logs/`（私有步骤日志）、可选预览二维码。
+
+每次构建会依次打并上传三个包（361f / ee7d / 13b0）；任一包构建或上传失败则整次失败，企业微信通知会附对应加密日志末尾。
 
 ## 恢复 / 停用
 
