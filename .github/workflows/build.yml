@@ -2,7 +2,12 @@ name: MP build
 
 # 本仓库是公开的，只放 workflow 与 README；小程序源码与脚本全在私有仓库（vars.CONTENT_REPO）。
 # 私有仓库 push → repository_dispatch(mp-build) → 本 workflow：checkout 指定 sha → 安装 / 类型检查 /
-# 构建（无上传密钥）→ 注入 MP_UPLOAD_KEY 上传或出预览二维码 → 加密 artifact → 企业微信通知。
+# 构建三个 appid 发行包（无上传密钥）→ 分别注入对应密钥上传或出预览二维码 → 加密 artifact → 企业微信通知。
+#
+# 三包与密钥对应（短标签只进公开日志，完整 appid 只进加密日志）：
+#   361f  wx361ffea9540b3d03  secrets.MP_UPLOAD_KEY       → dist/build/mp-weixin
+#   ee7d  wxee7d5cea3f941940  secrets.MP_UPLOAD_KEY_EE7D  → dist/build/mp-weixin-<appid>
+#   13b0  wx13b0a3575393c010  secrets.MP_UPLOAD_KEY_13B0  → dist/build/mp-weixin-<appid>（UGC）
 #
 # 公开仓库的日志与 artifact 谁都能看，所以：
 #   - 不用 actions/checkout（会打印提交标题 / 分支名）；改为 git init + fetch，输出进 $PRIV；
@@ -55,13 +60,15 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Preflight
         env:
           CONTENT_REPO: ${{ vars.CONTENT_REPO }}
           HAS_CONTENT_TOKEN: ${{ secrets.CONTENT_REPO_TOKEN != '' }}
           HAS_UPLOAD_KEY: ${{ secrets.MP_UPLOAD_KEY != '' }}
+          HAS_UPLOAD_KEY_EE7D: ${{ secrets.MP_UPLOAD_KEY_EE7D != '' }}
+          HAS_UPLOAD_KEY_13B0: ${{ secrets.MP_UPLOAD_KEY_13B0 != '' }}
           PRIV: ${{ runner.temp }}/private
         run: |
           set -euo pipefail
@@ -69,6 +76,8 @@ jobs:
           [ -n "${CONTENT_REPO}" ] || miss="$miss vars.CONTENT_REPO"
           [ "${HAS_CONTENT_TOKEN}" = "true" ] || miss="$miss secrets.CONTENT_REPO_TOKEN"
           [ "${HAS_UPLOAD_KEY}" = "true" ] || miss="$miss secrets.MP_UPLOAD_KEY"
+          [ "${HAS_UPLOAD_KEY_EE7D}" = "true" ] || miss="$miss secrets.MP_UPLOAD_KEY_EE7D"
+          [ "${HAS_UPLOAD_KEY_13B0}" = "true" ] || miss="$miss secrets.MP_UPLOAD_KEY_13B0"
           if [ -n "$miss" ]; then
             echo "::error::缺少配置：$miss（Settings → Secrets and variables → Actions）"
             exit 1
@@ -198,22 +207,34 @@ jobs:
           PRIV: ${{ runner.temp }}/private
         run: |
           set +e -uo pipefail
-          t0=$SECONDS
-          # 本步故意不注入 MP_UPLOAD_KEY
-          pnpm build:weapp >"$PRIV/build.log" 2>&1
-          rc=$?
-          if [ "$rc" -eq 0 ]; then
-            echo "✓ build（用时 $((SECONDS - t0))s，退出码 $rc）"
-          else
-            echo "✗ build（用时 $((SECONDS - t0))s，退出码 $rc）"
-            exit "$rc"
-          fi
+          # 本步故意不注入任何 MP_UPLOAD_KEY*；三个 appid 各自打一份发行包
+          fail=0
+          build_one() {
+            local label="$1"; shift
+            local t0=$SECONDS
+            "$@" >"$PRIV/build-${label}.log" 2>&1
+            local rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "✓ build ${label}（用时 $((SECONDS - t0))s，退出码 $rc）"
+            else
+              echo "✗ build ${label}（用时 $((SECONDS - t0))s，退出码 $rc）"
+              fail=1
+            fi
+          }
+          build_one 361f pnpm build:weapp
+          build_one ee7d pnpm build:weapp:ee7d
+          build_one 13b0 pnpm build:weapp:13b0
           # 版本号只写进私有目录，不进 GITHUB_ENV / GITHUB_OUTPUT
           node -e 'const v=require("./package.json").version; require("fs").writeFileSync(process.env.PRIV+"/version", v);'
+          # 兼容通知里扫旧文件名：把默认包日志再拷一份
+          [ -f "$PRIV/build-361f.log" ] && cp "$PRIV/build-361f.log" "$PRIV/build.log"
+          [ "$fail" -eq 0 ] || exit 1
 
       - name: Upload
         env:
-          MP_UPLOAD_KEY: ${{ secrets.MP_UPLOAD_KEY }}
+          KEY_361F: ${{ secrets.MP_UPLOAD_KEY }}
+          KEY_EE7D: ${{ secrets.MP_UPLOAD_KEY_EE7D }}
+          KEY_13B0: ${{ secrets.MP_UPLOAD_KEY_13B0 }}
           PRIV: ${{ runner.temp }}/private
         run: |
           set +e -uo pipefail
@@ -229,16 +250,39 @@ jobs:
             export MP_DESC="$(cat "$PRIV/desc.override")"
           fi
           export MP_ROBOT="$ROBOT"
-          t0=$SECONDS
-          node scripts/mp-ci.mjs "$MODE" --skip-build >"$PRIV/upload.log" 2>&1
-          rc=$?
-          # 公开日志只写通过/失败与用时，不写 mode/robot/版本
-          if [ "$rc" -eq 0 ]; then
-            echo "✓ upload（用时 $((SECONDS - t0))s，退出码 $rc）"
-          else
-            echo "✗ upload（用时 $((SECONDS - t0))s，退出码 $rc）"
-            exit "$rc"
-          fi
+          fail=0
+          upload_one() {
+            local label="$1" appid="$2" key=""
+            case "$label" in
+              361f) key="$KEY_361F" ;;
+              ee7d) key="$KEY_EE7D" ;;
+              13b0) key="$KEY_13B0" ;;
+              *) echo "✗ upload ${label}：未知标签"; fail=1; return ;;
+            esac
+            local t0=$SECONDS
+            # 每次只把当前包的密钥暴露给子进程，用完立刻清掉
+            export MP_UPLOAD_KEY="$key"
+            node scripts/mp-ci.mjs "$MODE" --skip-build --appid "$appid" >"$PRIV/upload-${label}.log" 2>&1
+            local rc=$?
+            unset MP_UPLOAD_KEY
+            if [ "$rc" -eq 0 ]; then
+              echo "✓ upload ${label}（用时 $((SECONDS - t0))s，退出码 $rc）"
+            else
+              echo "✗ upload ${label}（用时 $((SECONDS - t0))s，退出码 $rc）"
+              fail=1
+            fi
+          }
+          # 完整 appid 只进加密日志；公开日志只用短标签
+          {
+            echo "361f=wx361ffea9540b3d03"
+            echo "ee7d=wxee7d5cea3f941940"
+            echo "13b0=wx13b0a3575393c010"
+          } >"$PRIV/appids.txt"
+          upload_one 361f "wx361ffea9540b3d03"
+          upload_one ee7d "wxee7d5cea3f941940"
+          upload_one 13b0 "wx13b0a3575393c010"
+          [ -f "$PRIV/upload-361f.log" ] && cp "$PRIV/upload-361f.log" "$PRIV/upload.log"
+          [ "$fail" -eq 0 ] || exit 1
 
       - name: Encrypt artifact
         if: always()
@@ -254,15 +298,20 @@ jobs:
           STAGE="${RUNNER_TEMP}/stage"
           rm -rf "$STAGE"
           mkdir -p "$STAGE/logs" "$STAGE/dist" "${RUNNER_TEMP}/out"
-          if [ -d dist/build/mp-weixin ]; then
-            cp -a dist/build/mp-weixin "$STAGE/dist/"
+          if [ -d dist/build ]; then
+            # 三个 appid 产物：mp-weixin 与 mp-weixin-wx*
+            for d in dist/build/mp-weixin dist/build/mp-weixin-wx*; do
+              [ -d "$d" ] || continue
+              cp -a "$d" "$STAGE/dist/"
+            done
           fi
           if [ -d "$PRIV" ]; then
             cp -a "$PRIV"/. "$STAGE/logs/" 2>/dev/null || true
           fi
-          if [ -f dist/mp-preview.jpg ]; then
-            cp dist/mp-preview.jpg "$STAGE/"
-          fi
+          for f in dist/mp-preview.jpg dist/mp-preview-wx*.jpg; do
+            [ -f "$f" ] || continue
+            cp "$f" "$STAGE/"
+          done
           OUT="${RUNNER_TEMP}/out/run-${GITHUB_RUN_NUMBER}.tar.gz.enc"
           tar czf - -C "$STAGE" . 2>/dev/null \
             | openssl enc -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -salt -pass env:PASS \
@@ -314,7 +363,7 @@ jobs:
           fi
           {
             printf '**分支** %s · **sha** %s · **版本** %s\n' "$BRANCH" "$SHORT" "$VER"
-            printf '**结果** %s' "$RESULT"
+            printf '**结果** %s · **三包** 361f / ee7d / 13b0' "$RESULT"
             [ -n "$TOOK" ] && printf ' · **用时** %s' "$TOOK"
             echo
           } >"$N/summary.md"
@@ -322,7 +371,10 @@ jobs:
             {
               echo "✗ 构建/上传失败"
               echo "--- 日志末尾 ---"
-              for f in checkout.log upload.log build.log typecheck.log install.log; do
+              for f in checkout.log \
+                       upload-361f.log upload-ee7d.log upload-13b0.log upload.log \
+                       build-361f.log build-ee7d.log build-13b0.log build.log \
+                       typecheck.log install.log; do
                 if [ -s "$PRIV/$f" ]; then
                   echo "### $f"
                   tail -n 30 "$PRIV/$f"
